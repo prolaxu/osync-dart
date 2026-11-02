@@ -8,12 +8,17 @@ import 'transport.dart';
 final class SyncStatus {
   const SyncStatus({
     this.syncing = false,
+    this.offline = false,
     this.lastSuccess,
     this.lastError,
     this.nextRetry,
   });
 
   final bool syncing;
+
+  /// No network: nothing is attempted until [AutoSync.networkChanged] says
+  /// it is back.
+  final bool offline;
   final DateTime? lastSuccess;
   final Object? lastError;
 
@@ -21,24 +26,39 @@ final class SyncStatus {
   final DateTime? nextRetry;
 }
 
-/// Keeps a [SyncClient] in sync without the app calling [SyncClient.sync]:
-/// shortly after local writes (batched by [debounce]), every [interval], and
-/// on [syncNow] — e.g. when the app resumes, the network returns, or a push
-/// notification says the server has news. Failures back off exponentially up
-/// to [maxBackoff]; an unauthorized answer stops it until [start] is called
-/// again with a fresh session.
+/// Keeps a [SyncClient] in sync without the app calling [SyncClient.sync].
+///
+/// It syncs:
+/// - when the app opens ([start]) and returns to the foreground
+///   ([appResumed]), skipping a resume within [resumeGap] of the last
+///   success — a share sheet or permission prompt is not a new session;
+/// - the moment the network comes back ([networkChanged]);
+/// - shortly after local writes, batched by [debounce];
+/// - every [interval] while running, as a fallback for changes made
+///   elsewhere — or on [syncNow], e.g. from a push notification.
+///
+/// With [isOnline] given, no request is made while offline, so a phone in a
+/// tunnel neither burns retries nor drains the battery. Failures back off
+/// exponentially up to [maxBackoff]; an unauthorized answer stops it until
+/// [start] is called again with a fresh session.
 final class AutoSync {
   AutoSync(
     this.client, {
+    this.isOnline,
     this.debounce = const Duration(seconds: 2),
-    this.interval = const Duration(minutes: 5),
+    this.interval = const Duration(minutes: 15),
+    this.resumeGap = const Duration(seconds: 30),
     this.minBackoff = const Duration(seconds: 2),
     this.maxBackoff = const Duration(minutes: 5),
   });
 
   final SyncClient client;
+
+  /// Whether the device has a network now; null assumes it always does.
+  final Future<bool> Function()? isOnline;
   final Duration debounce;
   final Duration interval;
+  final Duration resumeGap;
   final Duration minBackoff;
   final Duration maxBackoff;
 
@@ -55,6 +75,7 @@ final class AutoSync {
 
   bool get running => _writes != null;
 
+  /// Starts syncing; call when the app opens. Syncs at once if online.
   void start() {
     if (running) return;
     _writes = client.changes.where((c) => c.origin == ChangeOrigin.local).listen((_) => _schedule(debounce));
@@ -71,9 +92,35 @@ final class AutoSync {
     _timer = null;
   }
 
-  /// Syncs now; never throws — the outcome is on [status].
+  /// The app is back in the foreground.
+  Future<void> appResumed() async {
+    if (!running) return;
+    final last = _current.lastSuccess;
+    if (last != null && DateTime.now().difference(last) < resumeGap) return;
+    await syncNow();
+  }
+
+  /// The network came or went. Coming back syncs at once, without waiting
+  /// out a backoff earned while it was down.
+  Future<void> networkChanged(bool online) async {
+    if (!running) return;
+    if (!online) {
+      _timer?.cancel();
+      _emit(SyncStatus(offline: true, lastSuccess: _current.lastSuccess));
+      return;
+    }
+    _failures = 0;
+    await syncNow();
+  }
+
+  /// Syncs now if online; never throws — the outcome is on [status].
   Future<void> syncNow() async {
     _timer?.cancel();
+    if (isOnline != null && !await isOnline!()) {
+      _emit(SyncStatus(offline: true, lastSuccess: _current.lastSuccess));
+      return;
+    }
+
     _emit(SyncStatus(syncing: true, lastSuccess: _current.lastSuccess));
     try {
       var report = await client.sync();

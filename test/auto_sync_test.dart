@@ -61,4 +61,67 @@ void main() {
     expect(server.requests, 0);
     await auto.dispose();
   });
+
+  test('makes no request while offline, and syncs the moment the network is back', () async {
+    var online = false;
+    final auto = AutoSync(client, isOnline: () async => online);
+    await client.put('notes', 'a', {'v': 1});
+
+    auto.start();
+    await settle();
+    expect(server.requests, 0);
+    expect(auto.current.offline, isTrue);
+
+    online = true;
+    await auto.networkChanged(true);
+    expect(server.requests, 1);
+    expect(await client.pendingCount(), 0);
+    expect(auto.current.offline, isFalse);
+    await auto.dispose();
+  });
+
+  test('losing the network cancels the pending retry', () async {
+    var online = true;
+    final auto = AutoSync(client, isOnline: () async => online, minBackoff: const Duration(milliseconds: 40));
+    server.failNext = 1;
+    auto.start();
+    await settle(10);
+    expect(auto.current.nextRetry, isNotNull);
+
+    online = false;
+    await auto.networkChanged(false);
+    await settle(100);
+    expect(server.requests, 0, reason: 'the retry would have succeeded; it was dropped while offline');
+    expect(auto.current.offline, isTrue);
+    await auto.dispose();
+  });
+
+  test('a resume right after a sync does not sync again; a later one does', () async {
+    final auto = AutoSync(client, resumeGap: const Duration(milliseconds: 80));
+    auto.start();
+    await settle(20);
+    expect(server.requests, 1);
+
+    await auto.appResumed();
+    expect(server.requests, 1);
+
+    await settle(100);
+    await auto.appResumed();
+    expect(server.requests, 2);
+    await auto.dispose();
+  });
+
+  test('pulls a long backlog to the end in one go', () async {
+    server = FakeServer(pageSize: 1);
+    for (var i = 0; i < 6; i++) {
+      server.serverEdit('notes', 'n$i', {'i': i}, Hlc(1000 + i, 0, 'server'));
+    }
+    final s = SqliteStore.inMemory();
+    final c =
+        await SyncClient.open(store: s, transport: server.transport(), collections: ['notes'], maxRounds: 2);
+    final auto = AutoSync(c);
+    await auto.syncNow();
+    expect((await c.all('notes')).length, 6);
+    s.close();
+  });
 }

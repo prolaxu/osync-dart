@@ -9,7 +9,7 @@ dependencies:
   osync:
     git:
       url: https://github.com/prolaxu/osync-dart
-      ref: v0.2.0
+      ref: v0.3.0
 ```
 
 ```dart
@@ -26,7 +26,7 @@ Pure Dart, so it works in Flutter, CLI tools and servers. `sqlite3` 3.x bundles 
 - **Safe to retry.** A failed round leaves the outbox intact, and an edit made while a sync is running is never lost.
 - **Handles deletes.** Deletes are kept as tombstones, so an older write can't bring a record back. On a server `reset`, synced records are dropped and reloaded, and unsent work is kept.
 - **Change streams.** `watch(collection)` emits local and remote changes for the UI.
-- **Background syncing.** `AutoSync` syncs shortly after local writes (batched), on a timer and on `syncNow()`. It backs off exponentially on failure and stops on 401.
+- **Syncs when it should.** `AutoSync` syncs on app open, on resume, the moment the internet returns, and shortly after local writes (batched). It makes no requests while offline, backs off exponentially on failure, and stops on 401.
 - **Other databases.** Implement `LocalStore` to sync into Isar, Drift or Hive instead of the bundled `SqliteStore`.
 
 ## Efficiency
@@ -48,6 +48,37 @@ How:
 - **Gzip both ways.** Request bodies over 1 KB are gzipped (`gzipFrom`), and responses are inflated by `dart:io`.
 - **SQLite settings.** WAL with `synchronous = NORMAL` (crash-safe, no fsync per commit), `WITHOUT ROWID` tables keyed the way they're read, and an outbox index in send order.
 - **Large backlogs.** A long pull stops at `maxRounds`, and `SyncReport.complete` says whether more is waiting; `AutoSync` carries on by itself.
+
+## Sync on open, on resume and when the internet returns
+
+Pure Dart has no app lifecycle or network events, so the app passes them in. In Flutter, with `connectivity_plus`:
+
+```dart
+bool hasNetwork(List<ConnectivityResult> r) => r.any((c) => c != ConnectivityResult.none);
+
+final auto = AutoSync(
+  sync,
+  isOnline: () async => hasNetwork(await Connectivity().checkConnectivity()),
+)..start();                                                     // app open: syncs now if online
+
+final lifecycle = AppLifecycleListener(onResume: auto.appResumed);           // back in foreground
+final network = Connectivity().onConnectivityChanged
+    .listen((r) => auto.networkChanged(hasNetwork(r)));                      // internet back: sync now
+
+// From an FCM data message saying the server has news:
+auto.syncNow();
+```
+
+| Event | What `AutoSync` does |
+|---|---|
+| `start()` (app open) | syncs now if online |
+| `appResumed()` | syncs, unless a sync finished within `resumeGap` (30 s) |
+| `networkChanged(true)` | syncs now and resets the retry backoff |
+| `networkChanged(false)` | drops the pending retry; `status` shows `offline` |
+| a local `put`/`delete` | syncs after `debounce` (2 s), batching the burst |
+| every `interval` (15 min) | a fallback check for changes made elsewhere |
+
+Watch `auto.status` for a "Syncing… / Offline / Synced 2 min ago" line.
 
 ## Usage
 
@@ -121,7 +152,7 @@ An HLC is `<15-digit ms>:<5-digit counter>:<node>`. It is fixed-width up to the 
 ## Tests
 
 ```sh
-dart pub get && dart test          # 31 tests; e2e and bench skipped
+dart pub get && dart test          # 35 tests; e2e and bench skipped
 dart test -t bench --run-skipped   # the numbers above
 ```
 
