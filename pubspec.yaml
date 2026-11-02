@@ -1,5 +1,5 @@
 name: osync
-description: Offline-first, two-way sync between an on-device SQLite database and a Laravel server running nepicsoft/osync.
+description: Offline-first, two-way sync between an on-device SQLite database and a Laravel server running prolaxu/osync.
 repository: https://github.com/prolaxu/osync-dart
 version: 0.4.0
 publish_to: none

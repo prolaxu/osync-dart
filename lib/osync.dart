@@ -1,5 +1,5 @@
 /// Offline-first, two-way sync between an on-device database and a Laravel
-/// server running `nepicsoft/osync`.
+/// server running `prolaxu/osync`.
 library;
 
 export 'src/auto_sync.dart';
