@@ -11,6 +11,7 @@ final class FakeServer {
   int compactedThrough = 0;
   final Map<String, Map<String, (int, Change)>> journal = {};
   int requests = 0;
+  final List<SyncRequest> received = [];
 
   /// Makes the next request fail as if the network dropped.
   int failNext = 0;
@@ -38,6 +39,7 @@ final class FakeServer {
 
   SyncResponse handle(SyncRequest request) {
     requests++;
+    received.add(request);
     final out = <String, CollectionResult>{};
     for (final MapEntry(key: name, value: push) in request.collections.entries) {
       final records = journal.putIfAbsent(name, () => {});
@@ -60,9 +62,13 @@ final class FakeServer {
       final from = reset ? 0 : push.cursor;
       final rows = records.values.where((e) => e.$1 > from).toList()..sort((a, b) => a.$1.compareTo(b.$1));
       final page = rows.take(pageSize).toList();
+      final node = request.node;
       out[name] = CollectionResult(
         cursor: page.isEmpty ? from : page.last.$1,
-        changes: [for (final (_, c) in page) c],
+        changes: [
+          for (final (_, c) in page)
+            if (reset || node == null || c.hlc.node != node) c,
+        ],
         hasMore: rows.length > pageSize,
         reset: reset,
         rejected: rejected,

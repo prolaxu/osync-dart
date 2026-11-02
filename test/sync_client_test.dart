@@ -152,6 +152,22 @@ void main() {
     expect(report.rounds, 3);
   });
 
+  test('says when it stopped at the round limit with more to come', () async {
+    server = FakeServer(pageSize: 1);
+    for (var i = 0; i < 5; i++) {
+      server.serverEdit('notes', 'n$i', {'i': i}, Hlc(1000 + i, 0, 'server'));
+    }
+    final store = SqliteStore.inMemory();
+    stores.add(store);
+    final a = await SyncClient.open(
+        store: store, transport: server.transport(), collections: ['notes'], maxRounds: 2);
+
+    expect((await a.sync()).complete, isFalse);
+    expect((await a.all('notes')).length, 2);
+    while (!(await a.sync()).complete) {}
+    expect((await a.all('notes')).length, 5);
+  });
+
   test('a failed round keeps the outbox for the next try', () async {
     final a = await device();
     await a.put('notes', 'n1', {'title': 'x'});
@@ -211,6 +227,60 @@ void main() {
 
     expect(second.node, first.node);
     expect((await store.get('notes', 'n1'))!.hlc.isAfter(stamp), isTrue);
+  });
+
+  test('a batch commits once and announces its writes after the commit', () async {
+    final a = await device();
+    final events = <String>[];
+    final sub = a.changes.listen((e) => events.add(e.id));
+
+    await a.batch(() async {
+      for (var i = 0; i < 3; i++) {
+        await a.put('notes', 'n$i', {'i': i});
+      }
+      expect(events, isEmpty);
+    });
+    await Future<void>.delayed(Duration.zero);
+    expect(events, ['n0', 'n1', 'n2']);
+
+    await expectLater(
+      a.batch(() async {
+        await a.put('notes', 'lost', {'x': 1});
+        throw StateError('abort');
+      }),
+      throwsStateError,
+    );
+    expect(await a.get('notes', 'lost'), isNull);
+    expect(await a.pendingCount(), 3);
+    await sub.cancel();
+  });
+
+  test('a remote delete leaves no row behind', () async {
+    final a = await device();
+    final b = await device();
+    await a.put('notes', 'n1', {'t': 1});
+    await a.sync();
+    await b.sync();
+    await a.delete('notes', 'n1');
+    await a.sync();
+    await b.sync();
+
+    expect(await b.all('notes'), isEmpty);
+    expect(await b.store.hlcs('notes', ['n1']), isEmpty);
+  });
+
+  test('tells the server its node, and is not sent its own changes back', () async {
+    final a = await device();
+    await a.put('notes', 'n1', {'t': 1});
+    final events = <RecordChanged>[];
+    final sub = a.changes.where((e) => e.origin == ChangeOrigin.remote).listen(events.add);
+    final report = await a.sync();
+    await Future<void>.delayed(Duration.zero);
+
+    expect(server.received.single.node, a.node);
+    expect(report.pulled, 0);
+    expect(events, isEmpty);
+    await sub.cancel();
   });
 
   test('refuses collections it was not opened with', () async {

@@ -12,17 +12,23 @@ import 'local_store.dart';
 ///
 /// `sqlite3` 3.x bundles SQLite through build hooks, so Flutter apps need no
 /// extra native package; open the file under the app's documents directory.
+///
+/// WAL with `synchronous = NORMAL` makes a commit a sequential append with no
+/// fsync until checkpoint: still crash-safe, and many times faster on phone
+/// flash than the default full sync.
 final class SqliteStore implements LocalStore {
   SqliteStore(this._db) {
     _db.execute('''
       PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      PRAGMA temp_store = MEMORY;
       CREATE TABLE IF NOT EXISTS osync_records (
         collection TEXT NOT NULL,
         id TEXT NOT NULL,
         hlc TEXT NOT NULL,
-        data TEXT,
+        data TEXT NOT NULL,
         PRIMARY KEY (collection, id)
-      );
+      ) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS osync_outbox (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         collection TEXT NOT NULL,
@@ -32,26 +38,46 @@ final class SqliteStore implements LocalStore {
         data TEXT,
         UNIQUE (collection, id)
       );
+      CREATE INDEX IF NOT EXISTS osync_outbox_order ON osync_outbox (collection, seq);
       CREATE TABLE IF NOT EXISTS osync_cursors (
         collection TEXT PRIMARY KEY,
         cursor INTEGER NOT NULL
-      );
+      ) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS osync_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
-      );
+      ) WITHOUT ROWID;
     ''');
+    _putStmt = _db.prepare(
+      'INSERT INTO osync_records (collection, id, hlc, data) VALUES (?, ?, ?, ?) '
+      'ON CONFLICT (collection, id) DO UPDATE SET hlc = excluded.hlc, data = excluded.data',
+      persistent: true,
+    );
+    _deleteStmt = _db.prepare('DELETE FROM osync_records WHERE collection = ? AND id = ?', persistent: true);
+    _unqueueStmt = _db.prepare('DELETE FROM osync_outbox WHERE seq = ?', persistent: true);
   }
 
   factory SqliteStore.open(String path) => SqliteStore(sqlite3.open(path));
 
   factory SqliteStore.inMemory() => SqliteStore(sqlite3.openInMemory());
 
+  /// SQLite's default host-parameter limit is far higher; this keeps each
+  /// IN list a comfortable size.
+  static const _chunk = 500;
+
   final Database _db;
+  late final PreparedStatement _putStmt;
+  late final PreparedStatement _deleteStmt;
+  late final PreparedStatement _unqueueStmt;
   static final _inTransaction = Object();
   Future<void> _queue = Future.value();
 
-  void close() => _db.close();
+  void close() {
+    _putStmt.close();
+    _deleteStmt.close();
+    _unqueueStmt.close();
+    _db.close();
+  }
 
   @override
   Future<T> transaction<T>(Future<T> Function() action) {
@@ -85,20 +111,38 @@ final class SqliteStore implements LocalStore {
 
   @override
   Future<List<SyncRecord>> all(String collection) async => _db
-      .select(
-        'SELECT collection, id, hlc, data FROM osync_records '
-        'WHERE collection = ? AND data IS NOT NULL ORDER BY id',
-        [collection],
-      )
+      .select('SELECT collection, id, hlc, data FROM osync_records WHERE collection = ? ORDER BY id',
+          [collection])
       .map(_record)
       .toList();
 
   @override
-  Future<void> put(SyncRecord record) async => _db.execute(
-        'INSERT INTO osync_records (collection, id, hlc, data) VALUES (?, ?, ?, ?) '
-        'ON CONFLICT (collection, id) DO UPDATE SET hlc = excluded.hlc, data = excluded.data',
-        [record.collection, record.id, record.hlc.toString(), _encode(record.data)],
-      );
+  Future<Map<String, Hlc>> hlcs(String collection, Iterable<String> ids) async {
+    final out = <String, Hlc>{};
+    for (final chunk in _chunks(ids)) {
+      for (final row in _db.select(
+        'SELECT id, hlc FROM osync_records WHERE collection = ? AND id IN (${_marks(chunk.length)})',
+        [collection, ...chunk],
+      )) {
+        out[row['id'] as String] = Hlc.parse(row['hlc'] as String);
+      }
+    }
+    return out;
+  }
+
+  @override
+  Future<void> putMany(List<SyncRecord> records) async {
+    for (final r in records) {
+      _putStmt.execute([r.collection, r.id, r.hlc.toString(), jsonEncode(r.data)]);
+    }
+  }
+
+  @override
+  Future<void> deleteMany(String collection, Iterable<String> ids) async {
+    for (final id in ids) {
+      _deleteStmt.execute([collection, id]);
+    }
+  }
 
   @override
   Future<void> clearSynced(String collection) async => _db.execute(
@@ -126,12 +170,19 @@ final class SqliteStore implements LocalStore {
       .toList();
 
   @override
-  Future<PendingChange?> pendingFor(String collection, String id) async {
-    final rows = _db.select(
-      'SELECT seq, collection, id, op, hlc, data FROM osync_outbox WHERE collection = ? AND id = ?',
-      [collection, id],
-    );
-    return rows.isEmpty ? null : _pending(rows.first);
+  Future<Map<String, PendingChange>> pendingFor(String collection, Iterable<String> ids) async {
+    final out = <String, PendingChange>{};
+    for (final chunk in _chunks(ids)) {
+      for (final row in _db.select(
+        'SELECT seq, collection, id, op, hlc, data FROM osync_outbox '
+        'WHERE collection = ? AND id IN (${_marks(chunk.length)})',
+        [collection, ...chunk],
+      )) {
+        final p = _pending(row);
+        out[p.change.id] = p;
+      }
+    }
+    return out;
   }
 
   @override
@@ -139,13 +190,8 @@ final class SqliteStore implements LocalStore {
 
   @override
   Future<void> removePending(Iterable<int> seqs) async {
-    final stmt = _db.prepare('DELETE FROM osync_outbox WHERE seq = ?');
-    try {
-      for (final seq in seqs) {
-        stmt.execute([seq]);
-      }
-    } finally {
-      stmt.close();
+    for (final seq in seqs) {
+      _unqueueStmt.execute([seq]);
     }
   }
 
@@ -175,16 +221,22 @@ final class SqliteStore implements LocalStore {
         [key, value],
       );
 
-  static String? _encode(Map<String, Object?>? data) => data == null ? null : jsonEncode(data);
+  static Iterable<List<String>> _chunks(Iterable<String> ids) sync* {
+    final list = ids.toSet().toList();
+    for (var i = 0; i < list.length; i += _chunk) {
+      yield list.sublist(i, i + _chunk > list.length ? list.length : i + _chunk);
+    }
+  }
 
-  static Map<String, Object?>? _decode(Object? text) =>
-      text == null ? null : (jsonDecode(text as String) as Map<String, Object?>);
+  static String _marks(int n) => List.filled(n, '?').join(', ');
+
+  static String? _encode(Map<String, Object?>? data) => data == null ? null : jsonEncode(data);
 
   static SyncRecord _record(Row row) => SyncRecord(
         collection: row['collection'] as String,
         id: row['id'] as String,
         hlc: Hlc.parse(row['hlc'] as String),
-        data: _decode(row['data']),
+        data: jsonDecode(row['data'] as String) as Map<String, Object?>,
       );
 
   static PendingChange _pending(Row row) => PendingChange(
@@ -194,7 +246,7 @@ final class SqliteStore implements LocalStore {
           id: row['id'] as String,
           op: SyncOp.parse(row['op'] as String),
           hlc: Hlc.parse(row['hlc'] as String),
-          data: _decode(row['data']),
+          data: row['data'] == null ? null : jsonDecode(row['data'] as String) as Map<String, Object?>,
         ),
       );
 }

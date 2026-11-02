@@ -1,22 +1,27 @@
 import 'change.dart';
+import 'hlc.dart';
 
 /// The device database the client syncs into.
 ///
 /// [SqliteStore] is the ready-made one; implement this to sync into another
-/// database (Isar, Drift, Hive). Every method is called inside [transaction]
-/// when the client needs several writes to land together.
+/// database (Isar, Drift, Hive). The client calls the bulk methods once per
+/// page of changes, so an implementation should do each in a few statements.
 abstract interface class LocalStore {
   /// Runs [action] atomically. Calls made from inside it join the same
   /// transaction.
   Future<T> transaction<T>(Future<T> Function() action);
 
-  /// The record, including a tombstone, or null if never seen.
   Future<SyncRecord?> get(String collection, String id);
 
-  /// Live records only.
   Future<List<SyncRecord>> all(String collection);
 
-  Future<void> put(SyncRecord record);
+  /// The stamps of those of [ids] the device holds.
+  Future<Map<String, Hlc>> hlcs(String collection, Iterable<String> ids);
+
+  /// Inserts or replaces each record.
+  Future<void> putMany(List<SyncRecord> records);
+
+  Future<void> deleteMany(String collection, Iterable<String> ids);
 
   /// Drops the collection's records, except those with a change still in the
   /// outbox — those are newer than anything the server can send.
@@ -27,7 +32,8 @@ abstract interface class LocalStore {
 
   Future<List<PendingChange>> pending(String collection, {required int limit});
 
-  Future<PendingChange?> pendingFor(String collection, String id);
+  /// The queued changes for those of [ids] that have one.
+  Future<Map<String, PendingChange>> pendingFor(String collection, Iterable<String> ids);
 
   Future<int> pendingCount();
 

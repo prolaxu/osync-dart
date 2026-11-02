@@ -53,8 +53,7 @@ final class PendingChange {
   final Change change;
 }
 
-/// A record as held on the device. Deleted records stay as tombstones so a
-/// late, older write cannot bring them back.
+/// A live record as held on the device.
 final class SyncRecord {
   const SyncRecord({
     required this.collection,
@@ -66,9 +65,5 @@ final class SyncRecord {
   final String collection;
   final String id;
   final Hlc hlc;
-
-  /// Null when deleted.
-  final Map<String, Object?>? data;
-
-  bool get deleted => data == null;
+  final Map<String, Object?> data;
 }

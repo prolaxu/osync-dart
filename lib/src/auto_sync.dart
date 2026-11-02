@@ -76,7 +76,10 @@ final class AutoSync {
     _timer?.cancel();
     _emit(SyncStatus(syncing: true, lastSuccess: _current.lastSuccess));
     try {
-      await client.sync();
+      var report = await client.sync();
+      while (!report.complete) {
+        report = await client.sync();
+      }
       _failures = 0;
       _emit(SyncStatus(lastSuccess: DateTime.now()));
     } on Object catch (error) {

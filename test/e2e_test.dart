@@ -99,7 +99,7 @@ void main() {
     await sita.sync();
 
     expect(await sita.all('notes'), isEmpty);
-    expect((await sita.all('mantras')).map((r) => r.data?['text']), ['Om Namah Shivaya']);
+    expect((await sita.all('mantras')).map((r) => r.data['text']), ['Om Namah Shivaya']);
   });
 
   test('invalid data comes back refused with the field errors', () async {
@@ -111,5 +111,60 @@ void main() {
     expect(rejection.reason, RejectionReason.invalid);
     expect(rejection.errors.keys, contains('title'));
     expect(jsonEncode(await phone.get('notes', 'bad')), '{"title":""}');
+  });
+
+  test('large rounds travel gzipped both ways', () async {
+    final phone = await device('ram');
+    await phone.batch(() async {
+      for (var i = 0; i < 300; i++) {
+        await phone.put('notes', 'n$i', {'title': 'Kundali number $i', 'body': 'Born in Kathmandu at dawn'});
+      }
+    });
+    await phone.sync();
+
+    final tablet = await device('ram');
+    var rounds = 0;
+    SyncReport report;
+    do {
+      report = await tablet.sync();
+      rounds += report.rounds;
+    } while (!report.complete);
+    expect((await tablet.all('notes')).length, 300);
+    expect(rounds, 100, reason: 'the e2e server pages 3 at a time');
+
+    final body = 'Born in Kathmandu at dawn, Mesha lagna, Moon in Rohini. ' * 60;
+    final raw = HttpClient()..autoUncompress = false;
+    final request = await raw.postUrl(Uri.parse('$base/api/sync'));
+    request.headers
+      ..set('Authorization', 'Bearer gita')
+      ..set('Accept', 'application/json')
+      ..set('Accept-Encoding', 'gzip')
+      ..set('Content-Encoding', 'gzip')
+      ..contentType = ContentType.json;
+    request.add(gzip.encode(utf8.encode(jsonEncode({
+      'protocol': 1,
+      'collections': {
+        'notes': {
+          'cursor': 0,
+          'changes': [
+            {
+              'id': 'big',
+              'op': 'upsert',
+              'hlc': '001790000000000:00000:raw',
+              'data': {'title': 'Big', 'body': body}
+            },
+          ],
+        },
+      },
+    }))));
+    final response = await request.close();
+    final bytes = await response.fold<List<int>>([], (all, chunk) => all..addAll(chunk));
+    raw.close();
+
+    expect(response.statusCode, 200);
+    expect(response.headers.value('content-encoding'), 'gzip');
+    final echoed = jsonDecode(utf8.decode(gzip.decode(bytes))) as Map<String, Object?>;
+    expect(jsonEncode(echoed).length, greaterThan(body.length));
+    expect(bytes.length, lessThan(body.length ~/ 5), reason: 'repetitive JSON shrinks well past 5x');
   });
 }

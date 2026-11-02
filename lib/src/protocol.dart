@@ -55,7 +55,7 @@ final class CollectionResult {
         changes: (json['changes'] as List<Object?>)
             .map((c) => Change.fromJson(c as Map<String, Object?>))
             .toList(),
-        rejected: (json['rejected'] as List<Object?>)
+        rejected: (json['rejected'] as List<Object?>? ?? const [])
             .map((r) => Rejection.fromJson(r as Map<String, Object?>))
             .toList(),
       );
@@ -83,12 +83,17 @@ final class CollectionPush {
 }
 
 final class SyncRequest {
-  const SyncRequest(this.collections);
+  const SyncRequest(this.collections, {this.node});
 
   final Map<String, CollectionPush> collections;
 
+  /// This device's HLC node, so the server can leave its own changes out of
+  /// the pull.
+  final String? node;
+
   Map<String, Object?> toJson() => {
         'protocol': syncProtocolVersion,
+        if (node != null) 'node': node,
         'collections': {for (final e in collections.entries) e.key: e.value.toJson()},
       };
 }

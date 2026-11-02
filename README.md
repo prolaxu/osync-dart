@@ -9,7 +9,7 @@ dependencies:
   osync:
     git:
       url: https://github.com/prolaxu/osync-dart
-      ref: v0.1.0
+      ref: v0.2.0
 ```
 
 ```dart
@@ -29,6 +29,26 @@ Pure Dart, so it works in Flutter, CLI tools and servers. `sqlite3` 3.x bundles 
 - **Background syncing.** `AutoSync` syncs shortly after local writes (batched), on a timer and on `syncNow()`. It backs off exponentially on failure and stops on 401.
 - **Other databases.** Implement `LocalStore` to sync into Isar, Drift or Hive instead of the bundled `SqliteStore`.
 
+## Efficiency
+
+Measured with `dart test -t bench --run-skipped` on a file database:
+
+| | v0.1 | now |
+|---|---|---|
+| Apply a 5,000-change pull | 128 ms | **50–78 ms** |
+| 1,000 local writes | 32–45 ms | **17 ms** in one `batch()` |
+| Own changes sent back after a push | all of them | **none** |
+
+How:
+- **Batched apply.** Each page of incoming changes costs two IN-list lookups (held stamps, queued changes) and one pass of reused prepared statements, not three queries per change.
+- **One commit for many writes.** `batch(() async { … })` puts many `put`/`delete` calls in one transaction, so there is one disk commit and nothing is applied if the callback throws. Change events fire after the commit.
+- **No tombstones on the device.** The server only ever sends a record's latest change, so a delete removes the row; an unsent local delete lives in the outbox. The database never fills with dead rows.
+- **Collapsed outbox.** A record edited ten times offline is pushed once.
+- **No echo.** Requests carry the device's node, so the server doesn't return the device's own writes.
+- **Gzip both ways.** Request bodies over 1 KB are gzipped (`gzipFrom`), and responses are inflated by `dart:io`.
+- **SQLite settings.** WAL with `synchronous = NORMAL` (crash-safe, no fsync per commit), `WITHOUT ROWID` tables keyed the way they're read, and an outbox index in send order.
+- **Large backlogs.** A long pull stops at `maxRounds`, and `SyncReport.complete` says whether more is waiting; `AutoSync` carries on by itself.
+
 ## Usage
 
 ```dart
@@ -44,6 +64,12 @@ final sync = await SyncClient.open(
 await sync.put('charts', chart.id, chart.toJson());   // offline-safe
 final charts = await sync.all('charts');
 sync.watch('charts').listen((change) => refresh());   // local and remote changes
+
+await sync.batch(() async {                            // many writes, one commit
+  for (final c in imported) {
+    await sync.put('charts', c.id, c.toJson());
+  }
+});
 
 final auto = AutoSync(sync)..start();                 // debounce + interval + backoff
 // on app resume / connectivity regained / push notification:
@@ -61,6 +87,7 @@ To sync into another database (Isar, Drift), implement `LocalStore`.
 // request
 {
   "protocol": 1,
+  "node": "dk3j…",            // this device's HLC node, so its own changes are not sent back
   "collections": {
     "notes": {
       "cursor": 41,
@@ -88,13 +115,14 @@ To sync into another database (Isar, Drift), implement `LocalStore`.
 }
 ```
 
-An HLC is `<15-digit ms>:<5-digit counter>:<node>`. It is fixed-width up to the node, so string order is clock order on both sides. `reason` is `stale` (with `current`), `invalid` (with `errors`) or `read_only`.
+An HLC is `<15-digit ms>:<5-digit counter>:<node>`. It is fixed-width up to the node, so string order is clock order on both sides. `reason` is `stale` (with `current`), `invalid` (with `errors`) or `read_only`. A delete has no `data` key, and `rejected` is absent when empty. Bodies may be gzipped (`Content-Encoding: gzip`) in either direction.
 
 
 ## Tests
 
 ```sh
-dart pub get && dart test          # 26 tests; e2e skipped
+dart pub get && dart test          # 31 tests; e2e and bench skipped
+dart test -t bench --run-skipped   # the numbers above
 ```
 
 End to end, against the real Laravel package:
@@ -104,5 +132,5 @@ End to end, against the real Laravel package:
 composer install && touch workbench/e2e.sqlite && vendor/bin/testbench serve --port=8787
 
 # here
-RLS_E2E_URL=http://127.0.0.1:8787 dart test -t e2e --run-skipped   # 4 tests
+RLS_E2E_URL=http://127.0.0.1:8787 dart test -t e2e --run-skipped   # 5 tests
 ```

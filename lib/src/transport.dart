@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' show gzip;
 
 import 'package:http/http.dart' as http;
 
@@ -27,13 +28,20 @@ class SyncTransportException implements Exception {
   String toString() => 'SyncTransportException(${statusCode ?? 'network'}): $message';
 }
 
+/// Sends a round as JSON over HTTP. Bodies over [gzipFrom] bytes go gzipped
+/// (the osync server inflates them); responses come back gzipped and
+/// `dart:io` inflates them, so a large pull costs a fraction on the wire.
 final class HttpSyncTransport implements SyncTransport {
   HttpSyncTransport(
     this.endpoint, {
     http.Client? client,
     this.headers,
     this.timeout = const Duration(seconds: 30),
+    this.gzipFrom = 1024,
   }) : _client = client ?? http.Client();
+
+  /// Null sends every body uncompressed.
+  final int? gzipFrom;
 
   final Uri endpoint;
 
@@ -44,6 +52,8 @@ final class HttpSyncTransport implements SyncTransport {
 
   @override
   Future<SyncResponse> send(SyncRequest request) async {
+    final json = utf8.encode(jsonEncode(request.toJson()));
+    final compress = gzipFrom != null && json.length >= gzipFrom!;
     final http.Response response;
     try {
       response = await _client
@@ -52,9 +62,10 @@ final class HttpSyncTransport implements SyncTransport {
             headers: {
               'Accept': 'application/json',
               'Content-Type': 'application/json',
+              if (compress) 'Content-Encoding': 'gzip',
               ...?await headers?.call(),
             },
-            body: jsonEncode(request.toJson()),
+            body: compress ? gzip.encode(json) : json,
           )
           .timeout(timeout);
     } on Exception catch (e) {

@@ -28,6 +28,10 @@ final class SyncReport {
   int pushed = 0;
   int pulled = 0;
   int rounds = 0;
+
+  /// False when the run stopped at [SyncClient.maxRounds] with more to send
+  /// or fetch; call [SyncClient.sync] again (AutoSync does) to carry on.
+  bool complete = false;
   final Set<String> reset = {};
 
   /// Local changes the server refused for good (invalid, read-only). The
@@ -64,6 +68,7 @@ final class SyncClient {
     return SyncClient._(store, transport, List.unmodifiable(collections), clock, pushBatch, maxRounds);
   }
 
+  static final _batchKey = Object();
   static const _nodeKey = 'node_id';
   static const _hlcKey = 'hlc';
 
@@ -97,6 +102,20 @@ final class SyncClient {
 
   Future<void> delete(String collection, String id) => _write(collection, id, null);
 
+  /// Runs [writes] — any number of [put] and [delete] calls — as one
+  /// transaction: one disk commit instead of one per write, and nothing
+  /// applied if [writes] throws. Change events are emitted after the commit.
+  Future<T> batch<T>(Future<T> Function() writes) async {
+    if (Zone.current[_batchKey] != null) return writes();
+    final events = <RecordChanged>[];
+    final result = await runZoned(
+      () => store.transaction(writes),
+      zoneValues: {_batchKey: events},
+    );
+    events.forEach(_changes.add);
+    return result;
+  }
+
   /// One full sync. Concurrent calls share the run already going.
   ///
   /// Throws [SyncTransportException] when the server cannot be reached; what
@@ -109,12 +128,20 @@ final class SyncClient {
     _known(collection);
     await store.transaction(() async {
       final hlc = _clock.tick();
-      final change = Change(id: id, op: data == null ? SyncOp.delete : SyncOp.upsert, hlc: hlc, data: data);
-      await store.put(SyncRecord(collection: collection, id: id, hlc: hlc, data: data));
-      await store.enqueue(collection, change);
+      if (data == null) {
+        await store.deleteMany(collection, [id]);
+      } else {
+        await store.putMany([SyncRecord(collection: collection, id: id, hlc: hlc, data: data)]);
+      }
+      await store.enqueue(
+        collection,
+        Change(id: id, op: data == null ? SyncOp.delete : SyncOp.upsert, hlc: hlc, data: data),
+      );
       await store.setMeta(_hlcKey, hlc.toString());
     });
-    _changes.add(RecordChanged(collection, id, data, ChangeOrigin.local));
+    final event = RecordChanged(collection, id, data, ChangeOrigin.local);
+    final batch = Zone.current[_batchKey] as List<RecordChanged>?;
+    batch == null ? _changes.add(event) : batch.add(event);
   }
 
   Future<SyncReport> _run() async {
@@ -124,6 +151,7 @@ final class SyncClient {
       report.rounds++;
       more = await _round(report);
     }
+    report.complete = !more;
     return report;
   }
 
@@ -140,7 +168,7 @@ final class SyncClient {
       );
     }
 
-    final response = await transport.send(SyncRequest(pushes));
+    final response = await transport.send(SyncRequest(pushes, node: node));
     final applied = <RecordChanged>[];
     var more = false;
 
@@ -151,21 +179,15 @@ final class SyncClient {
           await store.clearSynced(name);
           report.reset.add(name);
         }
-        for (final change in result.changes) {
-          if (await _applyRemote(name, change)) {
-            applied.add(RecordChanged(name, change.id, change.data, ChangeOrigin.remote));
-          }
+        final incoming = [
+          ...result.changes,
+          for (final r in result.rejected)
+            if (r.current case final current?) current,
+        ];
+        for (final r in result.rejected) {
+          if (r.current == null) report.refused.add((name, r));
         }
-        for (final rejection in result.rejected) {
-          final current = rejection.current;
-          if (current != null) {
-            if (await _applyRemote(name, current)) {
-              applied.add(RecordChanged(name, current.id, current.data, ChangeOrigin.remote));
-            }
-          } else {
-            report.refused.add((name, rejection));
-          }
-        }
+        applied.addAll(await _applyRemote(name, incoming));
         await store.setCursor(name, result.cursor);
         more = more || result.hasMore;
       }
@@ -176,26 +198,51 @@ final class SyncClient {
 
     report.pushed += sent.length;
     report.pulled += applied.length;
-    for (final event in applied) {
-      _changes.add(event);
-    }
+    applied.forEach(_changes.add);
     return more || await store.pendingCount() > 0;
   }
 
-  /// Takes [change] unless the device already holds the same or a newer
-  /// write. Returns whether the record changed.
-  Future<bool> _applyRemote(String collection, Change change) async {
-    _clock.receive(change.hlc);
+  /// Takes each change unless the device already holds the same or a newer
+  /// write for that record: two lookups and one pass of writes per page, not
+  /// a round of queries per change.
+  Future<List<RecordChanged>> _applyRemote(String collection, List<Change> changes) async {
+    if (changes.isEmpty) return const [];
+    final ids = changes.map((c) => c.id);
+    final pending = await store.pendingFor(collection, ids);
+    final held = await store.hlcs(collection, ids);
 
-    final pending = await store.pendingFor(collection, change.id);
-    if (pending != null && pending.change.hlc.compareTo(change.hlc) >= 0) return false;
+    final latest = <String, Change>{};
+    for (final change in changes) {
+      _clock.receive(change.hlc);
+      final newest = latest[change.id];
+      if (newest == null || change.hlc.isAfter(newest.hlc)) latest[change.id] = change;
+    }
 
-    final local = await store.get(collection, change.id);
-    if (local != null && local.hlc.compareTo(change.hlc) >= 0) return false;
+    final puts = <SyncRecord>[];
+    final deletes = <String>[];
+    final overridden = <int>[];
+    final applied = <RecordChanged>[];
+    for (final change in latest.values) {
+      final queued = pending[change.id];
+      if (queued != null && queued.change.hlc.compareTo(change.hlc) >= 0) continue;
+      final local = held[change.id];
+      if (local != null && local.compareTo(change.hlc) >= 0) continue;
+      if (queued == null && local == null && change.op == SyncOp.delete) continue;
 
-    await store.put(SyncRecord(collection: collection, id: change.id, hlc: change.hlc, data: change.data));
-    if (pending != null) await store.removePending([pending.seq]);
-    return true;
+      final data = change.data;
+      if (data == null) {
+        deletes.add(change.id);
+      } else {
+        puts.add(SyncRecord(collection: collection, id: change.id, hlc: change.hlc, data: data));
+      }
+      if (queued != null) overridden.add(queued.seq);
+      applied.add(RecordChanged(collection, change.id, data, ChangeOrigin.remote));
+    }
+
+    await store.putMany(puts);
+    await store.deleteMany(collection, deletes);
+    await store.removePending(overridden);
+    return applied;
   }
 
   String _known(String collection) {
