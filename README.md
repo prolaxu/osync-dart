@@ -9,7 +9,7 @@ dependencies:
   osync:
     git:
       url: https://github.com/prolaxu/osync-dart
-      ref: v0.3.0
+      ref: v0.4.0
 ```
 
 ```dart
@@ -109,6 +109,10 @@ auto.syncNow();
 
 To sync into another database (Isar, Drift), implement `LocalStore`.
 
+**Moving from an older store.** `importRecords(collection, [(id:, data:, editedAtMillis:)])` brings records in stamped at their own edit time, so a conflict with the server still goes to whichever was really edited last. A `null` data imports a delete.
+
+**Signing in.** `requeueAll()` resets the cursors and queues every local record, so a newly signed-in account receives everything on the device and the device receives everything in the account.
+
 
 ## Protocol (v1)
 
@@ -152,7 +156,7 @@ An HLC is `<15-digit ms>:<5-digit counter>:<node>`. It is fixed-width up to the 
 ## Tests
 
 ```sh
-dart pub get && dart test          # 35 tests; e2e and bench skipped
+dart pub get && dart test          # 37 tests; e2e and bench skipped
 dart test -t bench --run-skipped   # the numbers above
 ```
 
@@ -165,3 +169,7 @@ composer install && touch workbench/e2e.sqlite && vendor/bin/testbench serve --p
 # here
 RLS_E2E_URL=http://127.0.0.1:8787 dart test -t e2e --run-skipped   # 5 tests
 ```
+
+## License
+
+MIT

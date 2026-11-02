@@ -116,6 +116,63 @@ final class SyncClient {
     return result;
   }
 
+  /// Brings records from an older store into this one, each stamped at its
+  /// own edit time ([editedAtMillis]) rather than now, so a conflict with
+  /// the server still goes to whichever was really edited last. A null data
+  /// imports a delete. Records already held here with a newer stamp are
+  /// left alone. Everything imported is queued to push.
+  Future<void> importRecords(
+    String collection,
+    Iterable<({String id, Map<String, Object?>? data, int editedAtMillis})> records,
+  ) async {
+    _known(collection);
+    final list = records.toList();
+    if (list.isEmpty) return;
+    await store.transaction(() async {
+      final held = await store.hlcs(collection, list.map((r) => r.id));
+      final pending = await store.pendingFor(collection, list.map((r) => r.id));
+      final puts = <SyncRecord>[];
+      final deletes = <String>[];
+      for (final r in list) {
+        final hlc = Hlc(max(r.editedAtMillis, 0), 0, node);
+        final newer = [held[r.id], pending[r.id]?.change.hlc].nonNulls.where((h) => h.compareTo(hlc) >= 0);
+        if (newer.isNotEmpty) continue;
+        _clock.receive(hlc);
+        final data = r.data;
+        if (data == null) {
+          deletes.add(r.id);
+        } else {
+          puts.add(SyncRecord(collection: collection, id: r.id, hlc: hlc, data: Map.unmodifiable(data)));
+        }
+        await store.enqueue(
+          collection,
+          Change(id: r.id, op: data == null ? SyncOp.delete : SyncOp.upsert, hlc: hlc, data: data),
+        );
+      }
+      await store.putMany(puts);
+      await store.deleteMany(collection, deletes);
+      final last = _clock.last;
+      if (last != null) await store.setMeta(_hlcKey, last.toString());
+    });
+  }
+
+  /// Starts over against an account, e.g. after signing in: every cursor goes
+  /// back to zero and every record on the device is queued again, so the
+  /// account receives everything here and this device receives everything
+  /// in the account. Records the account already holds at the same stamp
+  /// cost a no-op on the server.
+  Future<void> requeueAll() => store.transaction(() async {
+        for (final name in collections) {
+          await store.setCursor(name, 0);
+          final records = await store.all(name);
+          final pending = await store.pendingFor(name, records.map((r) => r.id));
+          for (final r in records) {
+            if (pending.containsKey(r.id)) continue;
+            await store.enqueue(name, Change(id: r.id, op: SyncOp.upsert, hlc: r.hlc, data: r.data));
+          }
+        }
+      });
+
   /// One full sync. Concurrent calls share the run already going.
   ///
   /// Throws [SyncTransportException] when the server cannot be reached; what

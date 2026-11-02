@@ -283,6 +283,41 @@ void main() {
     await sub.cancel();
   });
 
+  test('imports old records at their own edit times, so the later edit still wins', () async {
+    final a = await device(wall: () => 5000);
+    final b = await device(wall: () => 5000);
+    await b.put('notes', 'edited-later-on-b', {'v': 'b'});
+    await b.sync();
+
+    await a.importRecords('notes', [
+      (id: 'edited-later-on-b', data: {'v': 'old copy on a'}, editedAtMillis: 1000),
+      (id: 'only-on-a', data: {'v': 'a'}, editedAtMillis: 2000),
+      (id: 'deleted-on-a', data: null, editedAtMillis: 3000),
+    ]);
+    expect(await a.pendingCount(), 3);
+    await a.sync();
+
+    expect(await a.get('notes', 'edited-later-on-b'), {'v': 'b'});
+    expect(await a.get('notes', 'only-on-a'), {'v': 'a'});
+    expect(server.journal['notes']!['deleted-on-a']!.$2.op, SyncOp.delete);
+    expect((await a.store.get('notes', 'only-on-a'))!.hlc.millis, 2000);
+  });
+
+  test('requeueAll hands everything to a newly signed-in account and pulls its records', () async {
+    final a = await device();
+    await a.put('notes', 'guest', {'v': 1});
+    await a.sync();
+
+    server = FakeServer();
+    server.serverEdit('notes', 'account', {'v': 'from account'}, Hlc(1, 0, 'server'));
+    final b = await SyncClient.open(store: a.store, transport: server.transport(), collections: ['notes']);
+    await b.requeueAll();
+    await b.sync();
+
+    expect(server.journal['notes']!.containsKey('guest'), isTrue);
+    expect(await b.get('notes', 'account'), {'v': 'from account'});
+  });
+
   test('refuses collections it was not opened with', () async {
     final a = await device();
     expect(() => a.put('ghosts', 'x', {}), throwsArgumentError);
