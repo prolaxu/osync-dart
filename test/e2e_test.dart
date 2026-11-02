@@ -8,7 +8,7 @@ import 'package:http/http.dart' as http;
 import 'package:osync/osync.dart';
 import 'package:test/test.dart';
 
-/// Against the real Laravel package. Start it from the repo root with
+/// Against the real Laravel package. In a checkout of prolaxu/osync, start
 /// `vendor/bin/testbench serve --port=8787`, then run
 /// `RLS_E2E_URL=http://127.0.0.1:8787 dart test -t e2e`.
 void main() {
